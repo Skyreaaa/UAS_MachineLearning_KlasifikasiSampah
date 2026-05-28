@@ -18,8 +18,17 @@ env/
 dataset/processed/
 dataset/temp/
 
+# Dataset YOLO flat (generated — jalankan 3_yolo_training.py untuk membuat ulang)
+dataset/yolo_cls/
+
 # Model checkpoint training (bukan model akhir)
 model/resume_checkpoint.pth
+
+# Pretrained YOLO base models (auto-download saat training/inference)
+yolov8n-cls.pt
+yolov8n.pt
+yolo26n.pt
+*.onnx
 
 # Screenshots hasil capture
 capture_*.jpg

@@ -1,123 +1,92 @@
 """
 ====================================================
-  SCRIPT 4: REAL-TIME GARBAGE DETECTION + AUTO TRACKING
+  SCRIPT 4: REAL-TIME GARBAGE DETECTION (YOLO HYBRID)
   ─────────────────────────────────────────────────
-  Deteksi objek sampah secara otomatis menggunakan kamera.
-  Box bounding muncul sendiri & mengikuti objek di frame.
-
-  Cara kerja:
-    1. Warmup (40 frame) → model background MOG2 dibangun
-    2. Setiap frame: foreground detection via background subtraction
-    3. Kontur terbesar dijadikan bounding box (dengan padding & EMA smoothing)
-    4. Inference dilakukan pada crop area bounding box
-    5. Hasil (Level 1 + Level 2 + confidence %) ditampilkan di dalam box
+  Cara kerja (Hybrid Option C):
+    Detector  → YOLOv8n.pt (COCO pretrained)
+                Menemukan objek apa saja dalam frame secara otomatis.
+    Classifier→ model/yolo_best.pt (hasil 3_yolo_training.py)
+                Mengklasifikasikan crop objek ke 12 kelas sampah.
+    Mapping   → Level-2 (subkelas) → Level-1 (Organik/Anorganik/B3)
+                via label_mapping.json
 
   Kontrol:
-    R     = Reset background model (ulangi warmup)
-    C     = Ganti kamera (cycle ke kamera berikutnya)
+    C     = Ganti kamera
     SPACE = Capture screenshot
-    S     = Toggle Full / Minimal display
+    S     = Toggle Full / Minimal
     Q     = Quit
 ====================================================
 Install:
-  pip install opencv-python torch torchvision timm Pillow
+  pip install ultralytics opencv-python Pillow
 """
 
 import sys
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
 
-import cv2
-import torch
-import torch.nn as nn
-import json
+import cv2, json
 from pathlib import Path
-from PIL import Image
-import torchvision.transforms as transforms
-import timm
-import numpy as np
 from datetime import datetime
-
-# ─────────────────────────────────────────────────
-#  CONFIG
-# ─────────────────────────────────────────────────
-MODEL_PATH   = Path("model/best_model.pth")
-MAPPING_PATH = Path("dataset/label_mapping.json")
-IMG_SIZE     = 224
-DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-MIN_AREA      = 5000    # luas minimum foreground (pixel^2) agar dianggap objek
-BOX_PAD       = 30      # padding di sekitar bounding box objek
-ALPHA         = 0.30    # EMA smoothing — kecil=halus, besar=responsif
-HIDE_AFTER    = 20      # sembunyikan box setelah N frame tanpa deteksi
-WARMUP_FRAMES = 40      # frame awal untuk bangun model background
-
-print(f"\n  Device : {DEVICE}")
-print(f"  Model  : {MODEL_PATH}")
+import numpy as np
+from ultralytics import YOLO
 
 
 # ─────────────────────────────────────────────────
-#  LABEL MAPPING
+#  KONFIGURASI
 # ─────────────────────────────────────────────────
+BASE_DIR         = Path(__file__).parent.resolve()
+DETECTOR_MODEL   = "yolov8n.pt"                                   # COCO pretrained (auto-download)
+CLASSIFIER_MODEL = BASE_DIR / "model" / "yolo_best.pt"            # hasil 3_yolo_training.py
+MAPPING_PATH     = BASE_DIR / "dataset" / "label_mapping.json"
+
+DET_CONF  = 0.20   # confidence minimum detector (turunkan jika objek sering tidak terdeteksi)
+BOX_PAD   = 20     # padding di sekitar bounding box detector
+
+print(f"\n  Detector  : {DETECTOR_MODEL}")
+print(f"  Classifier: {CLASSIFIER_MODEL}")
+
+
+# ─────────────────────────────────────────────────
+#  VALIDASI FILE
+# ─────────────────────────────────────────────────
+if not CLASSIFIER_MODEL.exists():
+    print(f"\n[ERROR] Classifier belum ada: {CLASSIFIER_MODEL}")
+    print("  Jalankan dulu: python 3_yolo_training.py")
+    sys.exit(1)
+
+if not MAPPING_PATH.exists():
+    print(f"\n[ERROR] Label mapping tidak ditemukan: {MAPPING_PATH}")
+    sys.exit(1)
+
+
+# ─────────────────────────────────────────────────
+#  LOAD MODEL & MAPPING
+# ─────────────────────────────────────────────────
+print("\n[MODEL] Loading models...")
+detector   = YOLO(DETECTOR_MODEL)
+classifier = YOLO(str(CLASSIFIER_MODEL))
+print("  ✓ Detector  loaded")
+print("  ✓ Classifier loaded")
+
 with open(MAPPING_PATH) as f:
     mapping = json.load(f)
 
-NUM_LVL1 = len(mapping["lvl1_classes"])
-NUM_LVL2 = len(mapping["lvl2_classes"])
-print(f"  Level 1: {mapping['lvl1_classes']}")
-print(f"  Level 2: {mapping['lvl2_classes']}")
-
-
-# ─────────────────────────────────────────────────
-#  MODEL
-# ─────────────────────────────────────────────────
-class HierarchicalGarbageNet(nn.Module):
-    def __init__(self, backbone_name="efficientnet_b0",
-                 num_lvl1=NUM_LVL1, num_lvl2=NUM_LVL2):
-        super().__init__()
-        base     = timm.create_model(backbone_name, pretrained=False, num_classes=0)
-        feat_dim = base.num_features
-        self.backbone  = base
-        self.shared_fc = nn.Sequential(
-            nn.Linear(feat_dim, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(0.4))
-        self.head_lvl1 = nn.Sequential(
-            nn.Linear(512, 128), nn.ReLU(), nn.Dropout(0.3), nn.Linear(128, num_lvl1))
-        self.head_lvl2 = nn.Sequential(
-            nn.Linear(512, 256), nn.ReLU(), nn.Dropout(0.3), nn.Linear(256, num_lvl2))
-
-    def forward(self, x):
-        feat   = self.backbone(x)
-        shared = self.shared_fc(feat)
-        return self.head_lvl1(shared), self.head_lvl2(shared)
-
-
-def load_model():
-    print(f"\n[MODEL] Loading {MODEL_PATH}...")
-    m = HierarchicalGarbageNet()
-    m.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-    m.to(DEVICE).eval()
-    print("[MODEL] Loaded!")
-    return m
-
-model = load_model()
-
-val_transform = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-])
+sub_to_lvl1 = mapping["sub_to_lvl1"]   # lvl2_name → lvl1_name
+print(f"  Level 1 : {mapping['lvl1_classes']}")
+print(f"  Level 2 : {mapping['lvl2_classes']}")
 
 
 # ─────────────────────────────────────────────────
 #  COLORS
 # ─────────────────────────────────────────────────
 COLORS = {
-    "organik":   (30, 210, 30),
+    "organik"  : (30, 210, 30),
     "anorganik": (30, 150, 255),
-    "b3":        (40, 40, 255),
+    "b3"       : (40,  40, 255),
 }
 
 def get_color(lvl1):
+    """Return warna BGR berdasarkan kategori Level-1."""
     return COLORS.get(lvl1, (160, 160, 160))
 
 
@@ -125,7 +94,7 @@ def get_color(lvl1):
 #  CAMERA
 # ─────────────────────────────────────────────────
 def scan_cameras():
-    """Scan semua kamera yang tersedia (index 0–5, backend DSHOW & MSMF). Return list of (index, backend_id, backend_name, resolution)."""
+    """Scan semua kamera yang tersedia (index 0–5, backend DSHOW & MSMF)."""
     print("\n[CAMERA] Scanning...")
     available = []
     found     = set()
@@ -150,7 +119,7 @@ def scan_cameras():
 
 
 def open_camera(index, backend_id):
-    """Buka kamera dengan index & backend tertentu, set resolusi 1280×720 @ 30fps."""
+    """Buka kamera dan set resolusi 1280×720 @ 30fps."""
     cap = cv2.VideoCapture(index, backend_id)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
@@ -159,7 +128,7 @@ def open_camera(index, backend_id):
 
 
 def select_camera(available):
-    """Tampilkan pilihan kamera di terminal; return index pilihan dalam list available."""
+    """Tampilkan pilihan kamera; return index dalam list available."""
     if not available:
         return None
     if len(available) == 1:
@@ -175,79 +144,74 @@ def select_camera(available):
 
 
 # ─────────────────────────────────────────────────
-#  INFERENCE
+#  DETEKSI & KLASIFIKASI
 # ─────────────────────────────────────────────────
-@torch.no_grad()
-def predict_roi(frame_bgr, x1, y1, x2, y2):
-    crop = frame_bgr[y1:y2, x1:x2]
+def detect_largest(frame):
+    """
+    Jalankan YOLO detector pada frame; return bounding box (x1,y1,x2,y2) objek terbesar.
+    Return None jika tidak ada deteksi di atas DET_CONF.
+    """
+    H, W = frame.shape[:2]
+    results = detector(frame, conf=DET_CONF, verbose=False)
+    boxes   = results[0].boxes
+
+    if boxes is None or len(boxes) == 0:
+        return None
+
+    # Ambil bounding box dengan area terbesar
+    best_box  = None
+    best_area = 0
+    for box in boxes:
+        x1, y1, x2, y2 = [int(v) for v in box.xyxy[0]]
+        area = (x2 - x1) * (y2 - y1)
+        if area > best_area:
+            best_area = area
+            best_box  = (
+                max(0, x1 - BOX_PAD),
+                max(0, y1 - BOX_PAD),
+                min(W, x2 + BOX_PAD),
+                min(H, y2 + BOX_PAD),
+            )
+    return best_box
+
+
+def classify_crop(frame, x1, y1, x2, y2):
+    """
+    Klasifikasikan crop frame[y1:y2, x1:x2] dengan YOLO classifier.
+    Return (lvl1_name, lvl2_name, lvl1_conf%, lvl2_conf%) atau None jika crop kosong.
+    """
+    crop = frame[y1:y2, x1:x2]
     if crop.size == 0:
         return None
-    pil     = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-    t       = val_transform(pil).unsqueeze(0).to(DEVICE)
-    o1, o2  = model(t)
-    p1      = torch.softmax(o1, 1)[0].cpu().numpy()
-    p2      = torch.softmax(o2, 1)[0].cpu().numpy()
-    i1, i2  = p1.argmax(), p2.argmax()
-    return (mapping["lvl1_classes"][i1], float(p1[i1]) * 100,
-            mapping["lvl2_classes"][i2], float(p2[i2]) * 100,
-            p1, p2)
+
+    results  = classifier(crop, verbose=False)
+    probs    = results[0].probs
+    top1_idx = probs.top1
+    top1_conf= float(probs.top1conf) * 100
+    lvl2_name= results[0].names[top1_idx]
+    lvl1_name= sub_to_lvl1.get(lvl2_name, "unknown")
+
+    # Top-5 probs untuk bar chart
+    top5_idx  = probs.top5
+    top5_conf = [float(probs.data[i]) * 100 for i in top5_idx]
+
+    return lvl1_name, top1_conf, lvl2_name, top5_conf[0], probs
 
 
 # ─────────────────────────────────────────────────
-#  FOREGROUND DETECTION
-# ─────────────────────────────────────────────────
-def detect_object(frame, fgbg, learning_rate):
-    """
-    Deteksi objek foreground terbesar menggunakan background subtraction MOG2.
-
-    Pipeline:
-        1. apply MOG2 → foreground mask
-        2. Morphological open+close+dilate untuk menghilangkan noise
-        3. Cari kontur terbesar; filter dengan MIN_AREA
-        4. Return bounding box (x1,y1,x2,y2) dengan BOX_PAD, atau None jika tidak ada objek.
-    """
-    """Deteksi objek foreground terbesar. Return (x1,y1,x2,y2) atau None."""
-    H, W = frame.shape[:2]
-
-    fg = fgbg.apply(frame, learningRate=learning_rate)
-
-    # Bersihkan noise
-    k  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN,  k, iterations=1)
-    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, k, iterations=3)
-    fg = cv2.dilate(fg, k, iterations=2)
-
-    contours, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-
-    largest = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(largest) < MIN_AREA:
-        return None
-
-    x, y, w, h = cv2.boundingRect(largest)
-    x1 = max(0, x - BOX_PAD)
-    y1 = max(0, y - BOX_PAD)
-    x2 = min(W, x + w + BOX_PAD)
-    y2 = min(H, y + h + BOX_PAD)
-    return (x1, y1, x2, y2)
-
-
-# ─────────────────────────────────────────────────
-#  DRAW TRACKING BOX
+#  DRAW
 # ─────────────────────────────────────────────────
 def draw_box(frame, x1, y1, x2, y2, color, lvl1, c1, lvl2, c2):
-    """Gambar bounding box bergaya (sudut dekoratif, area luar digelapkan, label + confidence di dalam box)."""
-    box_w = x2 - x1
-    box_h = y2 - y1
-    corner = min(28, box_w // 4, box_h // 4)
+    """Gambar bounding box bergaya dengan label klasifikasi dan confidence %."""
+    box_w  = x2 - x1
+    corner = min(28, box_w // 4, (y2 - y1) // 4)
     th     = 3
 
     # Gelapkan area luar kotak
-    mask              = np.zeros(frame.shape[:2], dtype=np.uint8)
+    mask             = np.zeros(frame.shape[:2], dtype=np.uint8)
     mask[y1:y2, x1:x2] = 255
-    dark              = frame.copy()
-    dark[mask == 0]   = (dark[mask == 0] * 0.38).astype(np.uint8)
+    dark             = frame.copy()
+    dark[mask == 0]  = (dark[mask == 0] * 0.38).astype(np.uint8)
     np.copyto(frame, dark)
 
     # Border tipis
@@ -261,19 +225,18 @@ def draw_box(frame, x1, y1, x2, y2, color, lvl1, c1, lvl2, c2):
         cv2.line(frame, (px, py), (px + dx * corner, py), color, th)
         cv2.line(frame, (px, py), (px, py + dy * corner), color, th)
 
-    # ── Confidence % — besar, di dalam kotak (bawah) ──
+    # Confidence % — besar di bawah dalam kotak
     conf_txt   = f"{c1:.1f}%"
     conf_scale = max(0.7, min(2.0, box_w / 190))
     cf_sz, _   = cv2.getTextSize(conf_txt, cv2.FONT_HERSHEY_DUPLEX, conf_scale, 2)
     cf_x = x1 + (box_w - cf_sz[0]) // 2
     cf_y = y2 - 12
-    # shadow
     cv2.putText(frame, conf_txt, (cf_x + 2, cf_y + 2),
                 cv2.FONT_HERSHEY_DUPLEX, conf_scale, (0, 0, 0), 3)
     cv2.putText(frame, conf_txt, (cf_x, cf_y),
                 cv2.FONT_HERSHEY_DUPLEX, conf_scale, color, 2)
 
-    # ── Kategori Level 1 ──
+    # Level 1 kategori
     l1_scale = max(0.6, min(1.3, box_w / 230))
     l1_sz, _ = cv2.getTextSize(lvl1.upper(), cv2.FONT_HERSHEY_DUPLEX, l1_scale, 2)
     l1_x = x1 + (box_w - l1_sz[0]) // 2
@@ -283,37 +246,37 @@ def draw_box(frame, x1, y1, x2, y2, color, lvl1, c1, lvl2, c2):
     cv2.putText(frame, lvl1.upper(), (l1_x, l1_y),
                 cv2.FONT_HERSHEY_DUPLEX, l1_scale, color, 2)
 
-    # ── Level 2 — di atas kategori ──
+    # Level 2 subkelas
     l2_txt  = f"{lvl2}  ({c2:.0f}%)"
-    l2_sz, _ = cv2.getTextSize(l2_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
+    l2_sz, _= cv2.getTextSize(l2_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
     l2_x = x1 + (box_w - l2_sz[0]) // 2
     l2_y = l1_y - l1_sz[1] - 6
     if l2_y > y1 + 10:
         cv2.rectangle(frame,
                       (l2_x - 4, l2_y - l2_sz[1] - 3),
-                      (l2_x + l2_sz[0] + 4, l2_y + 3),
-                      (0, 0, 0), -1)
+                      (l2_x + l2_sz[0] + 4, l2_y + 3), (0, 0, 0), -1)
         cv2.putText(frame, l2_txt, (l2_x, l2_y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, (220, 220, 220), 1)
 
+    # Label "YOLO" kecil di sudut kiri atas kotak
+    cv2.putText(frame, "YOLO", (x1 + 6, y1 + 16),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1)
+
 
 def draw_no_object_hint(frame):
-    """Tampilkan crosshair dan teks panduan di tengah frame saat tidak ada objek terdeteksi."""
-    """Tampilkan hint di tengah saat tidak ada objek terdeteksi."""
-    H, W = frame.shape[:2]
+    """Tampilkan crosshair dan hint teks saat tidak ada objek terdeteksi."""
+    H, W  = frame.shape[:2]
     msg   = "Letakkan / gerakkan sampah di depan kamera"
     scale = 0.58
     sz, _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
-    tx = (W - sz[0]) // 2
-    ty = H // 2
+    tx    = (W - sz[0]) // 2
+    ty    = H // 2
 
-    # Crosshair kecil di tengah
     cx, cy, arm = W // 2, H // 2, 18
     cv2.line(frame, (cx - arm, cy), (cx + arm, cy), (100, 100, 100), 1)
     cv2.line(frame, (cx, cy - arm), (cx, cy + arm), (100, 100, 100), 1)
     cv2.circle(frame, (cx, cy), 4, (100, 100, 100), 1)
 
-    # Background teks
     cv2.rectangle(frame, (tx - 8, ty + 18 - sz[1] - 4),
                   (tx + sz[0] + 8, ty + 22), (0, 0, 0), -1)
     cv2.putText(frame, msg, (tx, ty + 18),
@@ -321,7 +284,7 @@ def draw_no_object_hint(frame):
 
 
 # ─────────────────────────────────────────────────
-#  MAIN
+#  MAIN LOOP
 # ─────────────────────────────────────────────────
 def main():
     available = scan_cameras()
@@ -329,8 +292,8 @@ def main():
         print("\n[ERROR] Tidak ada kamera terdeteksi!")
         return
 
-    cam_list_idx = select_camera(available)
-    cam_idx, cam_bid, cam_bname, _ = available[cam_list_idx]
+    cam_idx_list = select_camera(available)
+    cam_idx, cam_bid, cam_bname, _ = available[cam_idx_list]
     cap = open_camera(cam_idx, cam_bid)
     if not cap.isOpened():
         print(f"[ERROR] Gagal buka kamera {cam_idx}")
@@ -338,22 +301,15 @@ def main():
 
     print(f"\n[CAMERA] Aktif: index={cam_idx} ({cam_bname})")
     print(f"\n[KONTROL]")
-    print(f"  R     = Reset background model")
     print(f"  C     = Ganti kamera")
     print(f"  SPACE = Capture screenshot")
     print(f"  S     = Toggle Full / Minimal")
     print(f"  Q     = Quit")
     print(f"\n{'='*60}\n")
-    print("[INFO] Warming up background model...")
 
-    # State
-    display_mode  = "full"
-    frame_count   = 0
-    fgbg          = cv2.createBackgroundSubtractorMOG2(
-                        history=150, varThreshold=60, detectShadows=False)
-    smooth_box    = None   # (x1,y1,x2,y2) float
-    no_det_frames = 0
-    last_result   = None   # hasil inference terakhir
+    display_mode = "full"
+    frame_count  = 0
+    last_result  = None   # simpan hasil terakhir
 
     while True:
         ret, frame = cap.read()
@@ -363,81 +319,39 @@ def main():
         frame_count += 1
         H, W = frame.shape[:2]
 
-        # ── Warmup: bangun background model dulu ──
-        if frame_count <= WARMUP_FRAMES:
-            fgbg.apply(frame, learningRate=0.1)
-            msg = f"Initializing... ({frame_count}/{WARMUP_FRAMES})"
-            cv2.putText(frame, msg, (W // 2 - 150, H // 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180, 180, 180), 1)
-            cv2.imshow("Garbage Detection - Auto Tracking", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-            continue
-
-        # ── Deteksi foreground ──
-        # Lambat saat ada objek (freeze background), lebih cepat saat kosong
-        lr       = 0.002 if smooth_box is not None else 0.008
-        raw_box  = detect_object(frame, fgbg, lr)
-
-        if raw_box is not None:
-            no_det_frames = 0
-            nb = tuple(float(v) for v in raw_box)
-            if smooth_box is None:
-                smooth_box = nb
-            else:
-                smooth_box = tuple(ALPHA * n + (1.0 - ALPHA) * s
-                                   for n, s in zip(nb, smooth_box))
-        else:
-            no_det_frames += 1
-            if no_det_frames >= HIDE_AFTER:
-                smooth_box = None
-
-        # ── Inference pada box jika ada ──
+        # ── Deteksi objek terbesar ──
+        bbox = detect_largest(frame)
         display_frame = frame.copy()
 
-        if smooth_box is not None:
-            bx1, by1, bx2, by2 = (int(v) for v in smooth_box)
-            bx1 = max(0, bx1); by1 = max(0, by1)
-            bx2 = min(W, bx2); by2 = min(H, by2)
+        if bbox is not None:
+            x1, y1, x2, y2 = bbox
 
-            if bx2 - bx1 > 30 and by2 - by1 > 30:
-                try:
-                    result = predict_roi(display_frame, bx1, by1, bx2, by2)
-                    if result:
-                        last_result = result
-                except Exception as e:
-                    print(f"[ERROR] {e}")
+            # ── Klasifikasi crop ──
+            result = classify_crop(display_frame, x1, y1, x2, y2)
+            if result:
+                last_result = result
+                lvl1, c1, lvl2, c2, probs = result
+                color = get_color(lvl1)
+                draw_box(display_frame, x1, y1, x2, y2, color, lvl1, c1, lvl2, c2)
 
-                if last_result:
-                    lvl1, c1, lvl2, c2, p1, p2 = last_result
-                    color = get_color(lvl1)
-                    draw_box(display_frame, bx1, by1, bx2, by2,
-                             color, lvl1, c1, lvl2, c2)
-
-                    if display_mode == "full":
-                        # Bar level 1 — kiri bawah
-                        bx_bar = 10
-                        by_bar = H - 90
-                        cv2.putText(display_frame, "Level 1:",
-                                    (bx_bar, by_bar - 4),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (190, 190, 190), 1)
-                        for i, (cls, prob) in enumerate(
-                                zip(mapping["lvl1_classes"], p1)):
-                            yo  = by_bar + i * 24
-                            bl  = int(130 * prob)
-                            ci  = get_color(cls)
-                            cv2.rectangle(display_frame,
-                                          (bx_bar, yo), (bx_bar + 130, yo + 18),
-                                          (70, 70, 70), 1)
-                            cv2.rectangle(display_frame,
-                                          (bx_bar, yo), (bx_bar + bl, yo + 18),
-                                          ci, -1)
-                            cv2.putText(display_frame,
-                                        f"{cls}: {prob*100:.0f}%",
-                                        (bx_bar + 138, yo + 13),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, ci, 1)
+                if display_mode == "full":
+                    # Bar top-5 Level-2 — kiri bawah
+                    cls_names  = [classifier.names[i] for i in probs.top5]
+                    cls_confs  = [float(probs.data[i]) * 100 for i in probs.top5]
+                    bx, by     = 10, H - 30 - len(cls_names) * 24
+                    cv2.putText(display_frame, "Top subkelas:",
+                                (bx, by - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (190, 190, 190), 1)
+                    for i, (cn, cf) in enumerate(zip(cls_names, cls_confs)):
+                        yo  = by + i * 24
+                        lvl = sub_to_lvl1.get(cn, "")
+                        ci  = get_color(lvl)
+                        bl  = int(130 * cf / 100)
+                        cv2.rectangle(display_frame, (bx, yo), (bx + 130, yo + 18), (70, 70, 70), 1)
+                        cv2.rectangle(display_frame, (bx, yo), (bx + bl,  yo + 18), ci, -1)
+                        cv2.putText(display_frame, f"{cn}: {cf:.0f}%",
+                                    (bx + 138, yo + 13),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, ci, 1)
         else:
-            # Tidak ada objek — tampilkan hint
             draw_no_object_hint(display_frame)
             last_result = None
 
@@ -447,36 +361,36 @@ def main():
             ov = display_frame.copy()
             cv2.rectangle(ov, (0, 0), (W, ph), (0, 0, 0), -1)
             cv2.addWeighted(ov, 0.55, display_frame, 0.45, 0, display_frame)
-            hints = "[R] Reset  [C] Kamera  [S] Mode  [SPACE] Simpan  [Q] Quit"
+            hints = "[C] Kamera  [S] Mode  [SPACE] Simpan  [Q] Quit  |  YOLO Hybrid"
             cv2.putText(display_frame, hints, (8, 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, (170, 170, 170), 1)
-            cam_info = f"CAM {cam_idx}({cam_bname})  #{frame_count}"
-            ci_sz, _ = cv2.getTextSize(cam_info, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
-            cv2.putText(display_frame, cam_info, (W - ci_sz[0] - 8, 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, (110, 110, 110), 1)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (170, 170, 170), 1)
+            ci_txt = f"CAM {cam_idx}({cam_bname})  #{frame_count}"
+            ci_sz, _ = cv2.getTextSize(ci_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
+            cv2.putText(display_frame, ci_txt, (W - ci_sz[0] - 8, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (110, 110, 110), 1)
+        else:
+            if last_result:
+                lvl1, c1, *_ = last_result
+                color = get_color(lvl1)
+                ov = display_frame.copy()
+                cv2.rectangle(ov, (0, 0), (220, 60), (0, 0, 0), -1)
+                cv2.addWeighted(ov, 0.5, display_frame, 0.5, 0, display_frame)
+                cv2.putText(display_frame, lvl1.upper(),
+                            (10, 44), cv2.FONT_HERSHEY_DUPLEX, 1.2, color, 2)
 
-        cv2.imshow("Garbage Detection - Auto Tracking", display_frame)
+        cv2.imshow("Garbage Detection - YOLO Hybrid", display_frame)
         key = cv2.waitKey(1) & 0xFF
 
         if key == ord('q'):
             print("\n[INFO] Keluar...")
             break
 
-        elif key == ord('r'):
-            fgbg       = cv2.createBackgroundSubtractorMOG2(
-                             history=150, varThreshold=60, detectShadows=False)
-            smooth_box    = None
-            no_det_frames = 0
-            last_result   = None
-            frame_count   = 0
-            print("[INFO] Background model di-reset")
-
         elif key == ord(' '):
             fname = f"capture_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
             cv2.imwrite(fname, display_frame)
             print(f"[SAVED] {fname}")
             if last_result:
-                lvl1, c1, lvl2, c2, *_ = last_result
+                lvl1, c1, lvl2, c2, _ = last_result
                 print(f"  -> {lvl1} {c1:.1f}%  |  {lvl2} {c2:.1f}%")
 
         elif key == ord('s'):
@@ -485,15 +399,9 @@ def main():
 
         elif key == ord('c'):
             cap.release()
-            cam_list_idx = (cam_list_idx + 1) % len(available)
-            cam_idx, cam_bid, cam_bname, _ = available[cam_list_idx]
-            cap           = open_camera(cam_idx, cam_bid)
-            smooth_box    = None
-            no_det_frames = 0
-            last_result   = None
-            frame_count   = 0
-            fgbg          = cv2.createBackgroundSubtractorMOG2(
-                                history=150, varThreshold=60, detectShadows=False)
+            cam_idx_list = (cam_idx_list + 1) % len(available)
+            cam_idx, cam_bid, cam_bname, _ = available[cam_idx_list]
+            cap = open_camera(cam_idx, cam_bid)
             print(f"[CAMERA] Ganti ke index={cam_idx} ({cam_bname})")
 
     cap.release()
@@ -501,8 +409,11 @@ def main():
     print("[INFO] Selesai!")
 
 
+# ─────────────────────────────────────────────────
+#  ENTRY POINT
+# ─────────────────────────────────────────────────
 if __name__ == "__main__":
     print("=" * 60)
-    print("  GARBAGE DETECTION - AUTO TRACKING")
+    print("  GARBAGE DETECTION - YOLO HYBRID (Detect + Classify)")
     print("=" * 60)
     main()
