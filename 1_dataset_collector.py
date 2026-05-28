@@ -1,7 +1,7 @@
 """
 ====================================================
   SCRIPT 1: DATASET COLLECTOR – HIERARKIS
-  Level 1 : Organik | Anorganik | B3
+  Level 1 : Anorganik | Organik | B3 | Residu
   Level 2 : Subkategori per level 1
   ─────────────────────────────────────────────────
   Dua sumber data yang didukung:
@@ -23,33 +23,42 @@ import shutil, zipfile, requests
 from tqdm import tqdm
 from icrawler.builtin import BingImageCrawler
 
+BASE_DIR = Path(__file__).parent.resolve()
 
 # ─────────────────────────────────────────────────
 #  HIERARKI KELAS
 # ─────────────────────────────────────────────────
 HIERARCHY = {
-    "organik": {
-        "sisa_makanan" : ["food waste garbage", "sisa makanan busuk", "organic food waste bin", "rotting fruit vegetable"],
-        "daun_ranting" : ["dry leaves garbage", "fallen leaves pile", "twigs branches waste", "sampah daun kering"],
-        "kayu"         : ["wood waste scrap", "wooden plank garbage", "bamboo waste pile", "potongan kayu sampah"],
-        "kertas_kardus": ["cardboard waste pile", "paper trash bin", "newspaper garbage", "dus kardus sampah"],
-    },
     "anorganik": {
-        "plastik" : ["plastic bottle waste", "plastic bag garbage", "plastic trash pile", "sampah plastik"],
-        "logam"   : ["metal can waste", "aluminum scrap garbage", "iron scrap pile", "kaleng sampah logam"],
-        "kaca"    : ["broken glass waste", "glass bottle garbage", "glass trash pile", "sampah kaca pecahan"],
-        "tekstil" : ["textile waste pile", "old clothes garbage", "fabric scrap waste", "sampah kain baju"],
-        "karet"   : ["rubber waste pile", "old tire garbage", "sandal rubber trash", "ban bekas sampah"],
+        "kaca"      : ["broken glass waste", "glass bottle garbage", "sampah kaca pecahan", "glass jar trash"],
+        "karet"     : ["rubber waste pile", "old tire garbage", "sandal rubber trash", "ban bekas sampah"],
+        "logam"     : ["metal can waste", "aluminum scrap garbage", "iron scrap pile", "kaleng sampah logam"],
+        "styrofoam" : ["styrofoam waste pile", "foam packaging garbage", "styrofoam trash", "styrofoam bekas sampah"],
+        "kardus"    : ["cardboard box waste", "corrugated cardboard trash", "dus kardus sampah", "cardboard garbage pile"],
+        "plastik"   : ["plastic bottle waste", "plastic bag garbage", "plastic trash pile", "sampah plastik"],
+        "tekstil"   : ["textile waste pile", "old clothes garbage", "fabric scrap waste", "sampah kain baju"],
+    },
+    "organik": {
+        "ampas"       : ["coffee grounds waste", "fruit pulp garbage", "ampas kopi sampah", "food pulp organic waste"],
+        "kayu"        : ["wood waste scrap", "wooden plank garbage", "bamboo waste pile", "potongan kayu sampah"],
+        "daun_ranting": ["dry leaves garbage", "fallen leaves pile", "twigs branches waste", "sampah daun kering"],
+        "kertas_tisu" : ["tissue paper waste", "used tissue garbage", "tisu kertas sampah", "paper tissue trash"],
     },
     "b3": {
-        "baterai_aki"  : ["battery waste disposal", "used battery garbage", "car battery scrap", "baterai bekas sampah"],
+        "baterai"      : ["battery waste disposal", "used battery garbage", "baterai bekas sampah", "dead battery waste"],
         "elektronik"   : ["electronic waste e-waste", "broken phone garbage", "PCB circuit board waste", "sampah elektronik"],
-        "cat_pelarut"  : ["paint can waste", "chemical solvent garbage", "used oil waste", "kaleng cat bekas"],
         "lampu_merkuri": ["fluorescent lamp waste", "mercury bulb garbage", "broken CFL bulb waste", "lampu TL bekas sampah"],
+        "medis"        : ["medical waste disposal", "used syringe garbage", "limbah medis sampah", "hospital waste trash"],
+        "kimia"        : ["chemical waste disposal", "paint can garbage", "solvent waste pile", "limbah kimia berbahaya"],
+    },
+    "residu": {
+        "popok_pembalut": ["used diaper waste", "sanitary pad garbage", "popok bekas sampah", "diaper trash pile"],
+        "puntung_rokok" : ["cigarette butt waste", "smoking litter garbage", "puntung rokok sampah", "cigarette stub trash"],
+        "sisa_konsumsi" : ["food waste leftovers", "mixed food garbage", "sisa makanan sampah", "leftover food trash"],
     },
 }
 
-RAW_DIR          = Path("dataset/raw")
+RAW_DIR          = BASE_DIR / "dataset" / "raw"
 SCRAPE_PER_QUERY = 80   # Gambar per keyword
 
 
@@ -57,19 +66,19 @@ SCRAPE_PER_QUERY = 80   # Gambar per keyword
 #  TRASHNET MAPPING (Opsional ~500MB)
 # ─────────────────────────────────────────────────
 TRASHNET_MAP = {
-    "paper"    : ("organik",   "kertas_kardus"),
-    "cardboard": ("organik",   "kertas_kardus"),
+    "paper"    : ("organik",   "kertas_tisu"),
+    "cardboard": ("anorganik", "kardus"),
     "plastic"  : ("anorganik", "plastik"),
     "metal"    : ("anorganik", "logam"),
     "glass"    : ("anorganik", "kaca"),
-    "trash"    : ("anorganik", "plastik"),
+    "trash"    : ("residu",    "sisa_konsumsi"),
 }
 
 def download_trashnet():
     """Download dan ekstrak dataset TrashNet (~500MB), lalu peta ke hierarki lokal."""
     url      = "https://github.com/garythung/trashnet/releases/download/v1.0/dataset-resized.zip"
-    zip_path = Path("dataset/trashnet.zip")
-    extract  = Path("dataset/trashnet_raw")
+    zip_path = BASE_DIR / "dataset" / "trashnet.zip"
+    extract  = BASE_DIR / "dataset" / "trashnet_raw"
 
     print("\n[TrashNet] Downloading (~500MB)...")
     zip_path.parent.mkdir(parents=True, exist_ok=True)
