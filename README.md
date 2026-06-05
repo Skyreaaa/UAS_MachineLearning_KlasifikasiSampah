@@ -21,7 +21,7 @@ Dibuat sebagai proyek UAS Machine Learning.
 ## Fitur Utama
 
 - **Unggah foto** → langsung diklasifikasi.
-- **Webcam langsung** → taruh sampah di kotak panduan, sistem auto-jepret & klasifikasi.
+- **Webcam langsung** → arahkan kamera ke sampah, ambil foto (langsung atau pakai timer 3 detik), lalu otomatis diklasifikasi.
 - **Klasifikasi 4 kategori** → anorganik, organik, B3, residu.
 - **Info lengkap per sampah** → kategori, warna tempat sampah, lama terurai, dan tips buang yang benar.
 - **Penanda "tidak yakin"** → kalau keyakinan model di bawah 20%, user diberi tahu daripada dipaksakan ke kategori yang salah.
@@ -32,7 +32,7 @@ Dibuat sebagai proyek UAS Machine Learning.
 ## Cara Kerja Singkat
 
 ```
-Foto/Webcam (Frontend React)
+Foto/Webcam (Frontend Vue 3)
         │  kirim gambar lewat HTTP
         ▼
 Backend FastAPI  ──►  Perbaiki kontras (CLAHE)
@@ -55,12 +55,15 @@ TrashTrack_UI/
 ├── backend/
 │   ├── main.py              # Server FastAPI + logika inferensi
 │   └── requirements.txt     # Dependensi Python backend
-├── frontend/
+├── frontend/                # Vue 3 + TypeScript + Vite + Tailwind
 │   ├── src/
-│   │   ├── App.jsx          # Komponen utama + komunikasi ke backend
-│   │   └── components/      # Navbar, UploadZone, WebcamCapture, ResultPanel, StatCard
+│   │   ├── App.vue          # Komponen utama (layout + status backend)
+│   │   ├── composables/     # useTheme, useBackendHealth, useClassifier
+│   │   ├── lib/             # categories.ts (warna kategori)
+│   │   ├── types.ts         # Tipe data (ClassifyResult, dll.)
+│   │   └── components/      # AppNavbar, ModeTabs, UploadZone, WebcamCapture, ResultPanel, StatCard
 │   ├── package.json
-│   └── vite.config.js       # Proxy /api → localhost:8000
+│   └── vite.config.ts       # Proxy /api → localhost:8000
 ├── pipeline/
 │   ├── 1_preprocessing.py   # Bersihkan, resize, augmentasi, bagi dataset
 │   └── 2_training.py        # Latih model YOLO11-cls (+ fine-tune)
@@ -85,13 +88,20 @@ Cek jalan atau tidak: buka `http://localhost:8000/health`.
 
 > Backend butuh `model/yolo_best.pt` ada. Kalau belum, jalankan pipeline dulu.
 
-### 2. Frontend (React + Vite)
+### 2. Frontend (Vue 3 + Vite)
 Dari folder `frontend/`:
 ```bash
 npm install
 npm run dev
 ```
 Buka alamat yang ditampilkan Vite (biasanya `http://localhost:5173`). Frontend otomatis meneruskan request `/api/...` ke backend di port 8000.
+
+Perintah lain:
+```bash
+npm run build       # build produksi ke folder dist/
+npm run preview     # pratinjau hasil build
+npm run type-check  # cek tipe TypeScript tanpa build
+```
 
 ---
 
@@ -146,18 +156,19 @@ python pipeline/2_training.py --finetune --epochs 30
 | Jalankan pipeline dari API | `POST /pipeline/run` — `backend/main.py:173` |
 | Cek status & log pipeline | `GET /pipeline/status` — `backend/main.py:185` |
 
-### Frontend — `frontend/src/`
+### Frontend — `frontend/src/` (Vue 3 + TypeScript)
 | Fitur | Lokasi |
 |------|--------|
-| Cek koneksi backend saat dibuka | `frontend/src/App.jsx:21` |
-| Kirim gambar ke `/classify` & terima hasil | `handleFile()` — `frontend/src/App.jsx:44` |
-| Simulasi progress bar saat memproses | `startProgressSim()` — `frontend/src/App.jsx:30` |
-| Ganti mode Upload ↔ Webcam | `switchMode()` — `frontend/src/App.jsx:92` |
-| Tema gelap/terang | `theme` — `frontend/src/App.jsx:102` |
-| Area drag & drop / pilih file | `frontend/src/components/UploadZone.jsx` |
-| Panel hasil deteksi (kartu, bar, tips) | `frontend/src/components/ResultPanel.jsx` |
-| Deteksi objek webcam (background subtraction) | `findLargestBlob()` — `frontend/src/components/WebcamCapture.jsx:56` |
-| Auto-jepret saat objek terkunci 3 detik | `triggerScan()` — `frontend/src/components/WebcamCapture.jsx:235` |
+| Layout utama, mode tab, status backend | `frontend/src/App.vue` |
+| Cek koneksi backend (`GET /health`) | `useBackendHealth()` — `frontend/src/composables/useBackendHealth.ts` |
+| Kirim gambar ke `/classify` + progress + hasil | `useClassifier()` — `frontend/src/composables/useClassifier.ts` |
+| Tema gelap/terang (toggle, simpan ke localStorage) | `useTheme()` — `frontend/src/composables/useTheme.ts` |
+| Warna per kategori & bar kepercayaan | `frontend/src/lib/categories.ts` |
+| Navbar + tombol toggle tema | `frontend/src/components/AppNavbar.vue` |
+| Tab Upload ↔ Webcam | `frontend/src/components/ModeTabs.vue` |
+| Area drag & drop / pilih file | `frontend/src/components/UploadZone.vue` |
+| Ambil foto dari webcam (+ timer 3 detik) | `frontend/src/components/WebcamCapture.vue` |
+| Panel hasil deteksi (kartu, bar, tips) | `frontend/src/components/ResultPanel.vue` |
 
 ### Pipeline — `pipeline/`
 | Fitur | Lokasi |
@@ -181,13 +192,14 @@ python pipeline/2_training.py --finetune --epochs 30
 - **Threshold keyakinan:** di bawah 20% → tidak diklasifikasikan, user diminta foto ulang. Di bawah 60% → hasil ditampilkan tapi diberi tanda "kurang yakin".
 - **Training butuh GPU.** Default `DEVICE = "0"` (GPU NVIDIA). Ganti ke `"cpu"` di `pipeline/2_training.py:22` kalau tanpa GPU.
 - **TTA menambah beban.** Tiap klasifikasi menjalankan model 5×. Kalau butuh lebih cepat bisa dikurangi di `classify_with_tta()`.
-- **Kotak di webcam bukan output AI.** Itu hasil deteksi gerakan (background subtraction) yang dikode manual, hanya untuk memicu auto-jepret.
+- **Kotak panduan di webcam bukan output AI.** Itu hanya bingkai statis untuk membantu memposisikan sampah sebelum difoto; klasifikasi dilakukan setelah foto diambil.
+- **Webcam butuh konteks aman.** Browser hanya mengizinkan akses kamera lewat `https://` atau `http://localhost`. Saat `npm run dev` (localhost) sudah aman.
 
 ---
 
 ## Teknologi yang Dipakai
 
 **Backend:** Python, FastAPI, Uvicorn, Ultralytics YOLO11, OpenCV, Pillow, NumPy.  
-**Frontend:** React 19, Vite, Tailwind CSS.  
+**Frontend:** Vue 3 (Composition API) + TypeScript, Vite, Tailwind CSS v4.  
 **Model:** YOLO11l-cls (klasifikasi), transfer learning dari bobot pretrained ImageNet.  
 **Pipeline:** Albumentations (augmentasi), Matplotlib, tqdm.
